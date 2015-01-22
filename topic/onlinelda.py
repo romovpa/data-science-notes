@@ -1,4 +1,3 @@
-import bz2
 import os
 import shutil
 import sys
@@ -6,6 +5,8 @@ import json
 import tempfile
 import subprocess
 import time
+import glob
+import math
 
 import gensim
 import numpy as np
@@ -59,6 +60,25 @@ def compute_perplexity_artm(corpus, Phi, Theta):
             sum_loglike += count * np.log( np.dot(Theta[doc_id, :], Phi[:, term_id]) )
     perplexity = np.exp(- sum_loglike / sum_n)
     return perplexity
+
+
+def start_report():
+    try:
+        uname = subprocess.check_output(['uname', '-a'])
+    except OSError:
+        uname = None
+    try:
+        lscpu = subprocess.check_output(['lscpu'])
+    except OSError:
+        lscpu = None
+
+    report = {
+        'machine': {
+            'uname': uname,
+            'lscpu': lscpu,
+        },
+    }
+    return report
 
 
 ### Interface for OnlineLDA implementation
@@ -145,9 +165,8 @@ def run_gensim(name, train, test, wordids,
 
     model.save('target/%s.gensim_model' % name)
 
-    report = {
-        'train_time': train_time,
-    }
+    report = start_report()
+    report['train_time'] = train_time
 
     Lambda = model.state.get_lambda()
     Phi = infer_stochastic_matrix(Lambda, 0)
@@ -262,9 +281,8 @@ def run_vw(name, train, test, wordids,
         train_time = timer.status()
     shutil.rmtree(tempdir)
 
-    report = {
-        'train_time': train_time,
-    }
+    report = start_report()
+    report['train_time'] = train_time
 
     Lambda = read_vw_lambdas(os.path.join(tempdir, 'readable_model'), n_term=len(id2word))
     Phi = infer_stochastic_matrix(Lambda, 0)
@@ -313,15 +331,86 @@ def run_vw(name, train, test, wordids,
 # Website: http://bigartm.org/
 #
 
+
 def run_bigartm(name, train, test, wordids,
                 num_processors=1, num_topics=100, batch_size=10000, passes=1,
                 kappa=0.5, tau0=64, alpha=0.1, beta=0.1, update_every=1, num_inner_iters=20):
 
     import artm.messages_pb2, artm.library
 
-    # TODO: generate chunk files
-    train_batches_folder = 'data/wiki_bow_test_batch_10k/'
-    test_batches_folder = 'data/wiki_bow_test_batch_10k/'
+    def calc_phi_sparsity(topic_model):
+        # topic_model should be an instance of messages_pb2.TopicModel class
+        # (http://docs.bigartm.org/en/latest/ref/messages.html#messages_pb2.TopicModel)
+        zeros = 0.0
+        for token_index in range(0, len(topic_model.token_weights)):
+            weights = topic_model.token_weights[token_index]
+            for topic_index in range(0, len(weights.value)):
+                if (weights.value[topic_index] < (0.001 / len(topic_model.token))):
+                    zeros += 1.0
+        return zeros / (len(topic_model.token_weights) * topic_model.topics_count)
+
+    def calc_theta_sparsity(theta_matrix):
+        # theta_matrix should be an instance of messages_pb2.ThetaMatrix class
+        # (http://docs.bigartm.org/en/latest/ref/messages.html#messages_pb2.ThetaMatrix)
+        zeros = 0.0
+        for item_index in range(0, len(theta_matrix.item_weights)):
+            weights = theta_matrix.item_weights[item_index]
+            for topic_index in range(0, len(weights.value)):
+                if (weights.value[topic_index] < (0.001 / num_topics)):
+                    zeros += 1.0
+        return zeros / (len(theta_matrix.item_weights) * theta_matrix.topics_count)
+
+    def calc_perplexity(topic_model, theta_matrix, batch):
+        item_map = {}
+        token_map = {}
+        perplexity = 0.0
+        perplexity_norm = 0.0
+        for item_index in range(0, len(theta_matrix.item_id)):
+            item_map[theta_matrix.item_id[item_index]] = item_index
+        for token_index in range(0, len(topic_model.token)):
+            token_map[topic_model.token[token_index]] = token_index
+        for item in batch.item:
+            if not item.id in item_map:
+                raise Exception('Unable to find item_id=' + str(item.id) + ' in the theta matrix')
+            theta_item_index = item_map[item.id]
+            item_weights = theta_matrix.item_weights[theta_item_index].value
+            field = item.field[0]
+            for field_token_index in range(0, len(field.token_id)):
+                batch_token_index = field.token_id[field_token_index]
+                token_count = field.token_count[field_token_index]
+                token = batch.token[batch_token_index]
+                if not token in token_map:
+                    raise Exception('Unable to find token=' + token + ' in the topic model')
+                model_token_index = token_map[token]
+                token_weights = topic_model.token_weights[model_token_index].value
+                if len(token_weights) != len(item_weights):
+                    raise Exception('Inconsistent topics count between Phi and Theta matrices')
+                pwd = 0.0
+                for topic_index in range(0, len(token_weights)):
+                    pwd += token_weights[topic_index] * item_weights[topic_index]
+                if pwd == 0:
+                    raise Exception('Implement DocumentUnigramModel or CollectionUnigramModel to resolve p(w|d)=0 cases')
+                perplexity += token_count * math.log(pwd)
+                perplexity_norm += token_count
+        return perplexity, perplexity_norm
+
+    def prepare_batch_files(name, wordids, batch_size):
+        batches_path = 'data/%s.bigartm_batches_%d' % (name, batch_size)
+        if not os.path.exists(batches_path):
+            subprocess.check_call([
+                'bigartm_cpp_client',
+                '--parsing_format', '1',
+                '-v', 'data/%s' % wordids,
+                '-d', '%s.mm' % name,
+                '--batch_folder', batches_path,
+                '--items_per_batch', str(batch_size),
+            ])
+        return batches_path
+
+    report = start_report()
+
+    train_batches_folder = prepare_batch_files(train, wordids, batch_size)
+    model_file_path = 'target/%s.bigartm_model' % name
 
     unique_tokens = artm.library.Library().LoadDictionary(train_batches_folder + 'dictionary')
 
@@ -334,6 +423,9 @@ def run_bigartm(name, train, test, wordids,
     perplexity_collection_config.model_type = artm.library.PerplexityScoreConfig_Type_UnigramCollectionModel
     perplexity_collection_config.dictionary_name = unique_tokens.name
 
+    base_path = os.getcwd()
+    log_dir = tempfile.mkdtemp()
+    os.chdir(log_dir)
 
     with artm.library.MasterComponent(master_config) as master:
         dictionary = master.CreateDictionary(unique_tokens)
@@ -362,24 +454,88 @@ def run_bigartm(name, train, test, wordids,
             first_sync = True
             next_items_processed = (batch_size * update_every)
             while (not done):
-                done = master.WaitIdle(10)    # Wait 10 ms and check if the number of processed items had changed
+                done = master.WaitIdle(10)
                 current_items_processed = items_processed_score.GetValue(model).value
                 if done or (current_items_processed >= next_items_processed):
                     update_count = current_items_processed / (batch_size * update_every)
-                    next_items_processed = current_items_processed + (batch_size * update_every)      # set next model update
-                    rho = pow(tau0 + update_count, -kappa)                                            # calculate rho
-                    model.Synchronize(decay_weight=(0 if first_sync else (1-rho)), apply_weight=rho)  # synchronize model
+                    next_items_processed = current_items_processed + (batch_size * update_every)
+                    rho = pow(tau0 + update_count, -kappa)
+                    model.Synchronize(decay_weight=(0 if first_sync else (1-rho)), apply_weight=rho)
                     first_sync = False
                     print "Items processed: %i, Elapsed time: %.3f " % (
                         timer.status()['elapsed_time'], current_items_processed)
 
-            report = {'train_time': timer.status()}
+            report['train_time'] = timer.status()
             with open('target/%s.report.json' % name, 'w') as report_file:
-                json.dump(report, report_file)
+                json.dump(report, report_file, indent=2)
 
         print "Saving topic model... ",
-        with open('target/%s.bigartm_model' % name, 'wb') as binary_file:
+        with open(model_file_path, 'wb') as binary_file:
             binary_file.write(master.GetTopicModel(model).SerializeToString())
-        print "Done. "
 
+    for test_key, test_name in test.iteritems():
+        print 'Testing on hold-out set "%s"' % test_key
 
+        report[test_key] = {}
+        test_batches_folder = prepare_batch_files(test_name, wordids, batch_size)
+
+        perplexity_collection_config = artm.messages_pb2.PerplexityScoreConfig()
+        perplexity_collection_config.model_type = artm.library.PerplexityScoreConfig_Type_UnigramCollectionModel
+        perplexity_collection_config.dictionary_name = unique_tokens.name
+
+        test_master_config = artm.messages_pb2.MasterComponentConfig()
+        test_master_config.processors_count = num_processors
+        test_master_config.cache_theta = True
+        test_master_config.disk_path = test_batches_folder
+
+        with artm.library.MasterComponent(test_master_config) as test_master:
+            print "Loading topic model... ",
+            topic_model = artm.messages_pb2.TopicModel()
+            with open(model_file_path, "rb") as binary_file:
+                topic_model.ParseFromString(binary_file.read())
+
+            test_dictionary = test_master.CreateDictionary(unique_tokens)
+            test_perplexity_score = test_master.CreatePerplexityScore(config = perplexity_collection_config)
+            smooth_sparse_phi = test_master.CreateSmoothSparsePhiRegularizer()
+            smooth_sparse_theta = test_master.CreateSmoothSparseThetaRegularizer()
+
+            test_model = test_master.CreateModel(topics_count = num_topics, inner_iterations_count = num_inner_iters)
+            test_model.EnableScore(test_perplexity_score)
+            test_model.EnableRegularizer(smooth_sparse_phi, beta)
+            test_model.EnableRegularizer(smooth_sparse_theta, alpha)
+            test_model.Overwrite(topic_model)
+
+            with TimeChecker() as timer:
+                print 'Estimate perplexity on held out batches... '
+                perplexity = 0.0; perplexity_norm = 1e-15
+                for test_batch_filename in glob.glob(test_batches_folder + "*.batch"):
+                    print 'Test batch:', test_batch_filename
+                    test_batch = artm.library.Library().LoadBatch(test_batch_filename)
+                    test_batch_theta = test_master.GetThetaMatrix(model=test_model, batch=test_batch)
+                    theta_sparsity = calc_theta_sparsity(test_batch_theta)
+                    (batch_perplexity, batch_perplexity_norm) = calc_perplexity(topic_model, test_batch_theta, test_batch)
+                    print 'Batch = %s, Theta sparsity = %f, Perplexity = %f' % (
+                        test_batch_filename, theta_sparsity, math.exp(-batch_perplexity / batch_perplexity_norm))
+                    perplexity += batch_perplexity
+                    perplexity_norm += batch_perplexity_norm
+                print 'Overall test perplexity = %f' % math.exp(-perplexity / perplexity_norm)
+
+                report[test_key]['inference_time'] = timer.status()
+                report[test_key]['perplexity_artm'] = math.exp(-perplexity / perplexity_norm)
+
+            with TimeChecker() as timer:
+                test_master.InvokeIteration()
+                test_master.WaitIdle()
+                print "Test Perplexity calculated in BigARTM = %.3f" % test_perplexity_score.GetValue(test_model).value
+
+                report[test_key]['bigartm_inference_time'] = timer.status()
+                report[test_key]['perplexity_bigartm'] = test_perplexity_score.GetValue(test_model).value
+
+    os.chdir(base_path)
+    subprocess.check_call(
+        ['tar', 'cfj', 'target/%s.logs.tar.bz2'] + glob.glob(os.path.join(log_dir, '..*'))
+    )
+    shutil.rmtree(log_dir)
+
+    with open('target/%s.report.json' % name, 'w') as report_file:
+        json.dump(report, report_file, indent=2)
