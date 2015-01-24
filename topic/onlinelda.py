@@ -140,7 +140,7 @@ def run_gensim(name, train, test, wordids,
                 alpha=alpha,
                 eta=beta,
                 decay=kappa,
-                eval_every=None,
+                eval_every=0,
                 iterations=num_inner_iters,
                 gamma_threshold=gamma_threshold,
             )
@@ -155,7 +155,7 @@ def run_gensim(name, train, test, wordids,
                 alpha=alpha,
                 eta=beta,
                 decay=kappa,
-                eval_every=None,
+                eval_every=0,
                 iterations=num_inner_iters,
                 gamma_threshold=gamma_threshold,
                 workers=num_processors-1, # minus one because `workers`
@@ -398,14 +398,14 @@ def run_bigartm(name, train, test, wordids,
         batches_path = 'data/%s.bigartm_batches_%d' % (name, batch_size)
         if not os.path.exists(batches_path):
             subprocess.check_call([
-                'bigartm_cpp_client',
+                './bigartm_cpp_client',
                 '--parsing_format', '1',
                 '-v', 'data/%s' % wordids,
-                '-d', '%s.mm' % name,
+                '-d', 'data/%s.mm' % name,
                 '--batch_folder', batches_path,
                 '--items_per_batch', str(batch_size),
             ])
-        return batches_path
+        return batches_path + '/'
 
     report = start_report()
 
@@ -465,13 +465,22 @@ def run_bigartm(name, train, test, wordids,
                     print "Items processed: %i, Elapsed time: %.3f " % (
                         timer.status()['elapsed_time'], current_items_processed)
 
-            report['train_time'] = timer.status()
-            with open('target/%s.report.json' % name, 'w') as report_file:
-                json.dump(report, report_file, indent=2)
+        os.chdir(base_path)
+        log_files = glob.glob(os.path.join(log_dir, '..*'))
+        if len(log_files) > 0:
+            subprocess.check_call(
+                ['tar', 'cfj', 'target/%s.logs.tar.bz2' % name] + log_files
+            )
+        shutil.rmtree(log_dir)
 
-        print "Saving topic model... ",
+        print 'Saving topic model... '
         with open(model_file_path, 'wb') as binary_file:
             binary_file.write(master.GetTopicModel(model).SerializeToString())
+
+
+    report['train_time'] = timer.status()
+    with open('target/%s.report.json' % name, 'w') as report_file:
+        json.dump(report, report_file, indent=2)
 
     for test_key, test_name in test.iteritems():
         print 'Testing on hold-out set "%s"' % test_key
@@ -489,7 +498,7 @@ def run_bigartm(name, train, test, wordids,
         test_master_config.disk_path = test_batches_folder
 
         with artm.library.MasterComponent(test_master_config) as test_master:
-            print "Loading topic model... ",
+            print 'Loading topic model... '
             topic_model = artm.messages_pb2.TopicModel()
             with open(model_file_path, "rb") as binary_file:
                 topic_model.ParseFromString(binary_file.read())
@@ -530,12 +539,6 @@ def run_bigartm(name, train, test, wordids,
 
                 report[test_key]['bigartm_inference_time'] = timer.status()
                 report[test_key]['perplexity_bigartm'] = test_perplexity_score.GetValue(test_model).value
-
-    os.chdir(base_path)
-    subprocess.check_call(
-        ['tar', 'cfj', 'target/%s.logs.tar.bz2'] + glob.glob(os.path.join(log_dir, '..*'))
-    )
-    shutil.rmtree(log_dir)
 
     with open('target/%s.report.json' % name, 'w') as report_file:
         json.dump(report, report_file, indent=2)
