@@ -7,6 +7,7 @@ import email
 import argparse
 import operator
 import logging
+import json
 
 import bs4
 import dateutil
@@ -84,6 +85,9 @@ def parse_message(msg):
     return message_record
 
 
+def check_mime(msg):
+    return any(msg.has_key(key) for key in ('mime-version', 'message-id', 'delivered-to')) 
+
 def mailbox_to_json(archive, output_file):
     message_member = {}
     message_thread = {}
@@ -119,8 +123,9 @@ def mailbox_to_json(archive, output_file):
             f = archive.extractfile(member)
             msg = pyzmail.parse.PyzMessage.factory(f)
 
-            if not msg.has_key('mime-version'):
-                logger.warning('File {name} is not a MIME message'.format(member.name))
+            if not check_mime(msg):
+                logger.warning('File {name} is not a MIME message'.format(name=member.name))
+                continue
 
             msg_id = msg.get_decoded_header('message-id')
             msg_reply_to = msg.get_decoded_header('in-reply-to').split()
@@ -197,6 +202,9 @@ def mailbox_to_json(archive, output_file):
                 messages.append(msg_record)
 
         messages.sort(key=operator.itemgetter('timestamp'))
+        
+        if len(messages) == 0:
+            continue
 
         participants = {}
         for msg in messages:
