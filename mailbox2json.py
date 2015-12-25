@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import os
 import tarfile
 import collections
 import time
@@ -15,6 +16,12 @@ import pyzmail
 
 
 logger = logging.getLogger(__name__)
+
+
+def recursively_walk(dir_path):
+    for subpath, dirnames, filenames in os.walk(dir_path):
+        for filename in filenames:
+            yield os.path.join(subpath, filename)
 
 
 def html_to_plain(html):
@@ -53,7 +60,12 @@ def parse_message(msg):
     timestamp = time.mktime(email.utils.parsedate(msg.get_decoded_header('date')))
     #timestamp_iso = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%dT%H:%M:%S')
 
-    body_type, body_text = extract_message_text(msg)
+    body_type, body_text = None, None
+    try:
+        body_type, body_text = extract_message_text(msg)
+    except LookupError:
+        pass
+
 
     attachments = [
         {
@@ -88,7 +100,8 @@ def parse_message(msg):
 def check_mime(msg):
     return any(msg.has_key(key) for key in ('mime-version', 'message-id', 'delivered-to')) 
 
-def mailbox_to_json(archive, output_file):
+
+def mailbox_to_json(mailbox_dir, output_file):
     message_member = {}
     message_thread = {}
     message_info = {}
@@ -118,50 +131,49 @@ def mailbox_to_json(archive, output_file):
 
     logger.info('Start indexing mail headers')
     
-    for n, member in enumerate(archive):
-        if member.isfile():
-            f = archive.extractfile(member)
+    for n, filename in enumerate(recursively_walk(mailbox_dir)):
+        with open(filename) as f:
             msg = pyzmail.parse.PyzMessage.factory(f)
 
-            if not check_mime(msg):
-                logger.warning('File {name} is not a MIME message'.format(name=member.name))
-                continue
+        if not check_mime(msg):
+            logger.warning('File {name} is not a MIME message'.format(name=filename))
+            continue
 
-            msg_id = msg.get_decoded_header('message-id')
-            msg_reply_to = msg.get_decoded_header('in-reply-to').split()
-            msg_references = msg.get_decoded_header('references').split()
+        msg_id = msg.get_decoded_header('message-id')
+        msg_reply_to = msg.get_decoded_header('in-reply-to').split()
+        msg_references = msg.get_decoded_header('references').split()
 
-            if msg_id is None or len(msg_id) == 0:
-                msg_id = 'NO_MESSAGE_ID_%.10d' % n_no_message_id
-                logger.warning('Message {name} has no Message-ID, assign "{new_id}"'.format(
-                        name=member.name, new_id=msg_id))
-                n_no_message_id += 1
+        if msg_id is None or len(msg_id) == 0:
+            msg_id = 'NO_MESSAGE_ID_%.10d' % n_no_message_id
+            logger.warning('Message {name} has no Message-ID, assign "{new_id}"'.format(
+                    name=filename, new_id=msg_id))
+            n_no_message_id += 1
 
-            if msg_id in message_member:               
-                for suffix in xrange(100500):
-                    new_msg_id = msg_id + ('_DUPLICATE_%d' % suffix)
-                    if new_msg_id not in message_member:
-                        break
-                        
-                logger.warning('Duplicated Message-ID "{message_id}" in {name2} (previously occured in {name1}),'
-                                ' replaced to "{new_message_id}"'.format(
-                        message_id=msg_id,
-                        new_message_id=new_msg_id,
-                        name1=message_member[msg_id].name,
-                        name2=member.name,
-                    ))
-                
-                msg_id = new_msg_id
+        if msg_id in message_member:               
+            for suffix in xrange(100500):
+                new_msg_id = msg_id + ('_DUPLICATE_%d' % suffix)
+                if new_msg_id not in message_member:
+                    break
+                    
+            logger.warning('Duplicated Message-ID "{message_id}" in {name2} (previously occured in {name1}),'
+                            ' replaced to "{new_message_id}"'.format(
+                    message_id=msg_id,
+                    new_message_id=new_msg_id,
+                    name1=message_member[msg_id],
+                    name2=filename,
+                ))
+            
+            msg_id = new_msg_id
 
-            next_thread_id = n
-            message_thread[msg_id] = next_thread_id
-            merge_threads(msg_id, set(msg_references + msg_reply_to))
+        next_thread_id = n
+        message_thread[msg_id] = next_thread_id
+        merge_threads(msg_id, set(msg_references + msg_reply_to))
 
-            message_member[msg_id] = member            
-            message_info[msg_id] = {
-                'subject': msg.get_subject(),
-                'timestamp': time.mktime(email.utils.parsedate(msg.get_decoded_header('date'))),
-            }
+        message_member[msg_id] = filename            
+        message_info[msg_id] = {
+            'subject': msg.get_subject(),
+            'timestamp': time.mktime(email.utils.parsedate(msg.get_decoded_header('date'))),
+        }
 
         if n % 1000 == 0 and n > 0:
             logger.info('Indexed {n} files, found {n_messages} messages'.format(
@@ -196,8 +208,8 @@ def mailbox_to_json(archive, output_file):
         messages = []
         for msg_id in thread_messages[thread_id]:
             if msg_id in message_member:
-                msg_file = archive.extractfile(message_member[msg_id])
-                msg = pyzmail.parse.PyzMessage.factory(msg_file)
+                with open(message_member[msg_id]) as f:
+                    msg = pyzmail.parse.PyzMessage.factory(f)
                 msg_record = parse_message(msg)
                 messages.append(msg_record)
 
@@ -246,12 +258,11 @@ if __name__ == '__main__':
     )
     
     parser = argparse.ArgumentParser(description='Convert mailbox to JSON dataset')
-    parser.add_argument('mailbox_archive')
+    parser.add_argument('mailbox_dir')
     parser.add_argument('jsonlines_output')
     args = parser.parse_args()
-    
-    archive = tarfile.open(args.mailbox_archive)
+
     with open(args.jsonlines_output, 'w') as output_file:
-        mailbox_to_json(archive, output_file)
+        mailbox_to_json(args.mailbox_dir, output_file)
 
         
